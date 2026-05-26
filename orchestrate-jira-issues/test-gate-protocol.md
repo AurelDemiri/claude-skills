@@ -10,7 +10,57 @@ The orchestrator does NOT run tests for you. It is purely the broker.
 
 **DDEV is one shared instance.** All workers point at the same DDEV project (same database, same web container, same ports). The stick serializes test runs so they don't trample each other's database state, fixture data, queue, or Chrome session. DDEV does NOT get stopped/started between holders.
 
-The shared-DDEV constraint means workers' code changes can affect each other's test runs if any of them mutate code on shared mounts. In practice each worker only mutates files inside its worktree, and `ddev php artisan test` reads code via the worktree's path — so isolation is by worktree on disk, with serialization on the database/Chrome via the stick.
+## Shared-DDEV reality: the worktree is NOT mounted
+
+This is the single most important thing to understand, and it's easy to get wrong.
+
+DDEV mounts the **main repo** — the `approot` from `.ddev/config.yaml`, which is the directory where `ddev start` was first run (e.g. `/Users/bigmac/Projects/VLWPLA`). It does **not** mount your worktree at `../worktrees/<KEY>`. So when you `cd` into your worktree and run `ddev php artisan test`, the container executes the **main repo's** copy of the code, not the files you just edited in the worktree. A new test file that exists only in your worktree is **invisible** to the container and will report as "no tests found".
+
+The orchestrator tells you in your dispatch prompt whether this applies via `DDEV_MOUNT_MATCHES_WORKTREE: true|false`:
+
+- **`true`** (rare — DDEV was started inside the worktree, or mounts are configured per-worktree): run `ddev php artisan test` directly from your worktree. Nothing special.
+- **`false`** (the normal case): use the **copy-test-restore** pattern below.
+
+### Copy-test-restore (the supported pattern when the mount is the main repo)
+
+While holding the stick, mirror your changed files into the main repo, run the test there, then restore the main repo to its original state before releasing:
+
+```bash
+MAIN=/Users/bigmac/Projects/VLWPLA          # the mounted approot (from your dispatch prompt)
+WORKTREE="$(pwd)"
+BACKUP=$(mktemp -d)
+
+# Files you changed relative to the base branch (tracked) — add untracked test files explicitly if needed
+CHANGED=$(git diff --name-only develop; git ls-files --others --exclude-standard)
+
+# Back up main's versions, copy your worktree versions in
+for f in $CHANGED; do
+  if [ -f "$MAIN/$f" ]; then
+    mkdir -p "$BACKUP/$(dirname "$f")"; cp "$MAIN/$f" "$BACKUP/$f"
+  else
+    echo "$f" >> "$BACKUP/.new_in_main"        # track files that must be removed on restore
+  fi
+  mkdir -p "$MAIN/$(dirname "$f")"; cp "$WORKTREE/$f" "$MAIN/$f"
+done
+
+# Run the test against the mounted main repo
+( cd "$MAIN" && ddev php artisan test --compact --filter=YourFilter )
+TEST_EXIT=$?
+
+# Restore main to its original state
+for f in $CHANGED; do
+  if [ -f "$BACKUP/$f" ]; then cp "$BACKUP/$f" "$MAIN/$f"; fi
+done
+while IFS= read -r f; do rm -f "$MAIN/$f"; done < "$BACKUP/.new_in_main" 2>/dev/null
+rm -rf "$BACKUP"
+
+# Sanity check: main repo must be clean again
+( cd "$MAIN" && git status --porcelain )       # expect empty output
+```
+
+**Why this is safe:** the stick guarantees only one worker is mutating the main repo at a time. Without the stick this pattern is forbidden — two workers copying into the same main repo would overwrite each other's test files and produce garbage results.
+
+**Restore is not optional.** If for any reason you cannot restore the main repo to a clean `git status` (a copy failed, you were interrupted, the test left artifacts), set `exit_state: "dirty"` in your release receipt so the orchestrator runs aggressive cleanup and warns the next holder. A dirty main repo silently breaks the next worker's test run. Verify `git status --porcelain` on the main repo is empty before you release; if it isn't, restore the offending paths with `git -C "$MAIN" checkout -- <path>` (tracked) or `rm` (untracked), then re-check.
 
 ## Directory layout
 
@@ -26,6 +76,8 @@ Inside the project repo (gitignored, the orchestrator creates these at start of 
 ```
 
 The orchestrator maintains a single in-memory "current holder" (worker_id or None). The protocol survives orchestrator restarts because grant files persist on disk — on resume, the orchestrator scans the dirs and reconstructs state.
+
+**Timestamps.** Every timestamp in every JSON file below (`requested_at`, `granted_at`, `released_at`) is produced by `date -u +%FT%TZ` — UTC, ISO 8601, e.g. `2026-05-18T10:30:00Z`. Both sides generate them this way; do not hand-format timestamps, on either the worker or orchestrator side.
 
 ## Acquire request: `lock-requests/<worker-id>-<seq>.json`
 
@@ -61,7 +113,7 @@ Orchestrator writes when the stick is granted:
     "closed 2 leftover chrome-devtools-mcp pages"
   ],
   "chrome_state": "no_pages_open",
-  "note": "DDEV is up and shared. Run your tests from your worktree. Release when done."
+  "note": "DDEV is up and shared. Test against the mounted main repo (copy-test-restore if your worktree isn't the mount). Release when done."
 }
 ```
 
@@ -208,6 +260,22 @@ DDEV stays up — no `ddev stop` / `ddev poweroff` between holders. The whole po
 The worker should NOT release after every single command. If a worker plans to run a failing test, then implement the fix, then re-run the test — that's all one stick-holding session. Release happens once at the end of the TDD cycle.
 
 Hold the stick for ~minutes at a time, not seconds. Long enough to do useful work; not so long that other workers starve.
+
+**Anti-pattern (do not do this):**
+
+```
+acquire → ddev php artisan test --filter=X (fails) → release
+acquire → edit one file → ddev php artisan test --filter=X (still fails) → release
+acquire → edit again → ddev php artisan test --filter=X (passes) → release
+```
+
+That's three acquires for one TDD cycle. With other workers waiting, each of those releases handed the stick away and made you re-queue behind them for no reason — and each grant cost the orchestrator a cleanup decision. The editing between test runs needs no stick (you edit files in your worktree, which never touches DDEV or Chrome), so there was never a reason to let go.
+
+**Correct pattern:** acquire once, run the whole red → green → refactor loop (and the copy-test-restore dance, if applicable) inside that single hold, release once.
+
+Release only when:
+- You've finished all the DDEV/browser work for this milestone — e.g. the test passes, you've committed, and the next thing on your plan is reading or editing files.
+- You expect a long pause before your next DDEV call (more than ~5 minutes of thinking or reading).
 
 If a worker discovers it needs much more time than expected (e.g., a slow integration test that takes 5 min), it should still hold; the orchestrator handles waiting in `lock-queue/`.
 

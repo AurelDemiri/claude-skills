@@ -32,12 +32,13 @@ Before starting, read these skills (they govern your behavior, not the worker's)
 
 ### Phase 1: Analyze
 
-Dispatch one analyzer subagent **per issue key in parallel** (single message, multiple `Agent` calls). Each analyzer:
+Dispatch one `jira-issue-analyzer` subagent **per issue key in parallel** (single message, multiple `Agent` calls, `subagent_type: "jira-issue-analyzer"`). That subagent definition carries the full analyzer contract — read-only tools, the workflow, the JSON schema, the confidence buckets, the "return ONLY JSON" rule. So the per-dispatch prompt stays tiny:
 
-1. Fetches the issue via `mcp__claude_ai_Atlassian__getJiraIssue`.
-2. Reads any linked Helpscout / Confluence / remote links.
-3. Greps the repo for symbols / files mentioned in the issue.
-4. Returns a JSON block with this exact shape:
+- The Jira key.
+- The working directory (the main repo path).
+- A one-line reminder: "Follow your analyzer instructions; return only the JSON assessment."
+
+Each analyzer fetches the issue, reads linked Helpscout / Confluence / remote links, greps the repo for referenced symbols, verifies any "Technische hint" against the code, and returns a JSON block with this shape (the authoritative copy of this schema and the buckets lives in `agents/jira-issue-analyzer.md` — keep the two in sync if you change either):
 
 ```json
 {
@@ -58,10 +59,10 @@ Dispatch one analyzer subagent **per issue key in parallel** (single message, mu
 |---|---|
 | `high` | Clear scope, code path identified, low blast radius, hint (if any) verified or not needed |
 | `medium` | Scope clear but multiple touchpoints, or hint unverified but plausible |
-| `low` | Vague, missing info, or requires guessing user intent |
-| `not_implementable` | Needs human input, dangerous, or requires Jira write access |
+| `low` | Vague, missing info, security-sensitive without a clear safe fix, or requires guessing user intent |
+| `not_implementable` | Needs human input, depends on unseeable production data, dangerous, or requires Jira write access |
 
-Analyzers must use **read-only tools only** — no edits, no branches, no commits. Limit each to 4-5 minutes of work.
+Using the dedicated subagent (rather than `general-purpose`) keeps each analyzer's discovery work — file reads, grep output, reasoning — out of your transcript; you receive only the JSON.
 
 ### Phase 2: Select
 
@@ -74,6 +75,8 @@ Filter out `not_implementable` from the question entirely; mention them in your 
 
 Recommend the high-confidence ones in your preamble, e.g.: "Recommended: VLWPLA-123, VLWPLA-126. Medium-confidence ones are also offered; skip the low-confidence ones unless you want a triage attempt."
 
+**If the user selects zero issues:** skip Phase 3 entirely. Do not create worktrees, do not set up `.claude/orchestrator/`, do not start the watcher — there are no workers to broker for. Go straight to a one-paragraph Phase 4 report: "No issues selected. Reviewed: [list]. Skipped because: [confidence reasons]. No worktrees created, no code changes." Then stop.
+
 ### Phase 3: Implement
 
 For each selected issue:
@@ -85,51 +88,111 @@ git worktree add ../worktrees/<KEY> -b <KEY>-impl
 mkdir -p ../worktrees/<KEY>/.claude/plans
 ```
 
-The `.claude/` directory is gitignored project-wide. Confirm by checking `.gitignore` includes `.claude/` or `/.claude` before dispatching workers. If it doesn't, add it to the repo's `.gitignore` in the worktree only — do NOT commit that change yet; it goes in with the worker's first commit if relevant.
+The orchestrator queue (`.claude/orchestrator/`) and worker plans (`.claude/plans/`) must not become git noise. Don't assume `.claude/` is gitignored project-wide — in this repo only specific sub-paths are (`.claude/settings.local.json`, `/.claude/worktrees`, `/.claude/projects`), so `.claude/orchestrator/` and `.claude/plans/` would otherwise show as untracked. Rather than editing the tracked `.gitignore` (which would itself be a committable change), add them to `.git/info/exclude` — a per-clone ignore list that is never committed:
+
+```bash
+printf '%s\n' '.claude/orchestrator/' '.claude/plans/' >> .git/info/exclude
+```
+
+Do this in the main repo (for the orchestrator queue) and in each worktree (for that worker's plan dir). `git worktree` gives each worktree its own `.git/info/exclude`, so apply it per worktree.
+
+**Detect the DDEV mount once.** DDEV mounts the `approot` it was started in — almost always the main repo, NOT the worktrees. Workers that run `ddev php artisan test` from a worktree will execute the main repo's code unless told otherwise (see `test-gate-protocol.md` → "Shared-DDEV reality"). Determine which case applies and pass the answer into every worker's dispatch prompt:
+
+```bash
+ddev describe -j 2>/dev/null | jq -r '.raw.approot'
+```
+
+If that path equals a worker's worktree path, put `DDEV_MOUNT_MATCHES_WORKTREE: true` in its prompt. Otherwise (the normal case) put `DDEV_MOUNT_MATCHES_WORKTREE: false` plus the mounted main-repo path, so the worker uses copy-test-restore.
 
 #### 3b. Set up the test-stick file queue (once, in the main repo)
 
+First **archive any leftover state** from a previous run. Stale grant files or a stale `SENTINEL_ALL_DONE` will make the watcher replay old requests or exit immediately. Archive rather than delete — the prior `lock-log/` is a real audit trail and a wedged run's queue is useful for post-mortem:
+
 ```bash
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+ARCHIVE=.claude/orchestrator/archive/${TS}
+for d in lock-requests lock-grants lock-queue lock-releases lock-log; do
+  if [ -d ".claude/orchestrator/$d" ] && [ -n "$(ls -A ".claude/orchestrator/$d" 2>/dev/null)" ]; then
+    mkdir -p "$ARCHIVE/$d"
+    mv .claude/orchestrator/$d/* "$ARCHIVE/$d/" 2>/dev/null || true
+  fi
+done
+mv .claude/orchestrator/SENTINEL_ALL_DONE "$ARCHIVE/" 2>/dev/null || true
 mkdir -p .claude/orchestrator/{lock-requests,lock-grants,lock-releases,lock-queue,lock-log}
 ```
 
-Start the watcher in the background and attach `Monitor`:
+The `archive/` subdir is never auto-cleaned — that's a manual housekeeping decision for the user.
+
+Start the watcher in the background. Wrap it in `bash -c '...'` with `shopt -s nullglob` — `Monitor`'s shell treats an unmatched glob as a literal (zsh `nomatch` style), so a bare `for f in dir/*.json` over an empty dir would error. The loop also checks a sentinel at the top so it can terminate cleanly:
 
 ```bash
-# Watcher: emits REQUEST: <id> and RELEASE: <id> events
-while true; do
-  for f in .claude/orchestrator/lock-requests/*.json; do
-    [ -f "$f" ] || continue
-    id=$(basename "$f" .json)
-    mv "$f" .claude/orchestrator/lock-queue/"$id".json 2>/dev/null \
-      && echo "REQUEST: $id"
+bash -c '
+  shopt -s nullglob
+  cd /abs/path/to/main-repo
+  while true; do
+    if [ -f .claude/orchestrator/SENTINEL_ALL_DONE ]; then
+      echo "ALL_DONE"; break
+    fi
+    for f in .claude/orchestrator/lock-requests/*.json; do
+      id=$(basename "$f" .json)
+      mv "$f" .claude/orchestrator/lock-queue/"$id".json 2>/dev/null && echo "REQUEST: $id"
+    done
+    for f in .claude/orchestrator/lock-releases/*.release; do
+      id=$(basename "$f" .release)
+      echo "RELEASE: $id"
+      mv "$f" .claude/orchestrator/lock-log/"$id".release 2>/dev/null
+    done
+    sleep 2
   done
-  for f in .claude/orchestrator/lock-releases/*.release; do
-    [ -f "$f" ] || continue
-    id=$(basename "$f" .release)
-    echo "RELEASE: $id"
-    mv "$f" .claude/orchestrator/lock-log/"$id".release 2>/dev/null
-  done
-  sleep 2
-done
+'
 ```
 
-Run via `Bash` with `run_in_background: true`. Attach `Monitor` to that shell ID with a pattern like `^(REQUEST|RELEASE): `. End the loop by echoing `ALL_DONE` to a sentinel file and having Monitor's `until` match `^ALL_DONE$`.
+Run via `Bash` with `run_in_background: true`; the response gives you the output-file path. Then attach `Monitor` to that file:
+
+```text
+Monitor command:  tail -f <bash-output-file> | grep -E --line-buffered "^(REQUEST|RELEASE|ALL_DONE)"
+timeout_ms:       3600000
+persistent:       false
+```
+
+To terminate when all workers are done: `echo "DONE" > .claude/orchestrator/SENTINEL_ALL_DONE`. The watcher prints `ALL_DONE` and exits, and Monitor stops on that line.
 
 #### 3c. Dispatch workers in parallel
 
-In a single message, call `Agent` once per selected issue with:
-- `subagent_type: "jira-issue-worker"`
-- `run_in_background: true`
-- A self-contained prompt (the worker won't see this conversation) that includes:
-  - The Jira key
-  - The absolute worktree path
-  - The absolute paths of `lock-requests/`, `lock-grants/`, `lock-releases/`
-  - The full pre-approved scope from Phase 1 analysis (title, summary, scope_files, risks)
-  - Branch name and commit-message prefix (`<KEY>: `)
-  - The stick rule: must acquire before running `ddev` or Chrome DevTools MCP; must release when done
+In a single message, call `Agent` once per selected issue with `subagent_type: "jira-issue-worker"` and `run_in_background: true`. The `jira-issue-worker` definition already carries the cardinal rules (stay in worktree, acquire-before-ddev, Jira read-only, no pushes, verify hints, the `timeout: 600000` requirement on blocking Bash calls). So the dispatch prompt only needs the issue-specific context. Use this template, filling every `{placeholder}`:
 
-See `test-gate-protocol.md` for the exact worker prompt template.
+```text
+Implement Jira issue {KEY} autonomously. Your plan is pre-approved — do not seek confirmation. On unresolvable ambiguity, commit what you have, append a `BLOCKED:` line to your plan, and exit.
+
+# Issue
+Key: {KEY}
+Title: {TITLE}
+Summary (from analysis): {SUMMARY}
+Pre-approved scope_files: {SCOPE_FILES}
+Known risks: {RISKS}
+Hint status: {HINT_VERIFIED}  (treat any Jira "Technische hint" as a hypothesis — verify against code)
+
+# Workspace
+Worktree (work ONLY here): {WORKTREE_PATH}
+Branch: {KEY}-impl   Commit prefix: "{KEY}: "
+Base branch: {BASE_BRANCH}
+Plan doc to write before any code: {WORKTREE_PATH}/.claude/plans/{KEY}.md
+
+# Test-stick (see your agent instructions + the protocol)
+Lock dirs (absolute):
+  requests: {MAIN_REPO}/.claude/orchestrator/lock-requests/
+  grants:   {MAIN_REPO}/.claude/orchestrator/lock-grants/
+  releases: {MAIN_REPO}/.claude/orchestrator/lock-releases/
+Acquire the stick before ANY ddev/Chrome call; release when your TDD cycle is done. Pass timeout:600000 on every Bash call that blocks on a grant file.
+
+# DDEV mount
+DDEV_MOUNT_MATCHES_WORKTREE: {true|false}
+Mounted main-repo path: {MAIN_REPO}
+If false, use the copy-test-restore pattern from the protocol (mirror changed files into {MAIN_REPO}, test, restore, verify main repo is clean before releasing).
+
+# Done when
+Return a single ≤200-word summary: outcome, commits, tests added/kept/dropped with rationale, final test result (PASS/FAIL/NOT RUN), your confidence, residual risks, plan-doc path.
+```
 
 #### 3d. Broker the stick while workers run
 
@@ -139,6 +202,8 @@ You will now receive two streams of notifications:
 2. **Background agent** notifications — worker completion.
 
 Maintain a single state variable: `current_holder` (worker_id+seq or `None`).
+
+**Single-worker fast path:** if only one issue was selected in Phase 2, there is no contention — every grant is unconditional and immediate. You can skip reading `lock-queue/` to "see who's next" (you know it's empty) and skip Chrome cleanup between that worker's successive acquires (the only previous holder is itself, which released cleanly). Keep following the protocol otherwise — still write each grant file and read each release receipt — because the file-queue is the audit trail and you don't want the worker's prompt or your own logic to diverge between single- and multi-worker runs.
 
 **On `REQUEST: <id>`:**
 
@@ -186,7 +251,18 @@ Build a single report for the user:
 - Plan doc: .claude/plans/VLWPLA-123.md (inside worktree)
 ```
 
-Repeat per issue. At the end, list the next manual steps:
+Repeat per issue. Then, if any issues were NOT implemented, account for them explicitly so nothing looks like it silently fell through:
+
+```
+### Not implemented this run
+
+- VLWPLA-XXX: <confidence bucket> — <why skipped (user deselected / triaged out)>
+- VLWPLA-YYY: not_implementable — <analyzer's reason; filtered before selection>
+```
+
+Omit this section entirely if every analyzed issue was implemented (don't print "None"). Include `not_implementable` issues that you filtered out of the Phase 2 question before the user saw them — the user should know you considered them.
+
+At the end, list the next manual steps:
 - "Review each worktree's diff."
 - "When ready, run `bkt pr create` yourself (per memory rule)."
 - "Run `git worktree remove <path>` once merged."
@@ -219,7 +295,8 @@ Workers receive a fully self-contained prompt. They MUST:
 ## Common mistakes
 
 - **Letting workers run `ddev` without holding the stick.** DDEV is shared. Two workers running `ddev php artisan test` simultaneously will trample each other's DB state and queue. The acquire-before-touch rule must be in every worker prompt.
-- **Forgetting to gitignore `.claude/`.** The orchestrator queue and worker plans are not committable.
+- **Assuming `ddev` in a worktree runs the worktree's code.** It runs the mounted main repo's code (see the DDEV-mount detection in 3a). A worker's new test file in the worktree is invisible to the container until copy-test-restore mirrors it into the mount. Always set `DDEV_MOUNT_MATCHES_WORKTREE` in the dispatch prompt.
+- **Keeping orchestrator scratch out of git via the tracked `.gitignore`.** Editing `.gitignore` is itself a committable change. Use `.git/info/exclude` (per-clone, never committed) for `.claude/orchestrator/` and `.claude/plans/` instead.
 - **Auto-pushing branches.** Violates `feedback_no_pr_without_consent.md`. Stop at local commit.
 - **Treating Jira hints as facts.** Hint sections are hypotheses (per `feedback_verify_jira_descriptions.md`); workers verify against code first.
 - **Skipping the report.** The user's only window into worker decisions is the final report. Include rationale for kept/dropped tests.
